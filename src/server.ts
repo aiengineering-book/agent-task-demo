@@ -8,6 +8,14 @@ export type ServerOptions = {
   port?: number;
   stepMs?: number;
   heartbeatMs?: number;
+  /**
+   * How long a subscriber may leave a write unflushed before it is dropped.
+   * A client that stops reading makes `res.write()` return false; if the
+   * socket does not drain within this time, the subscription is evicted.
+   */
+  drainTimeoutMs?: number;
+  /** Pads each heartbeat so a non-reading client fills its socket buffer quickly. Demo only. */
+  heartbeatPadBytes?: number;
 };
 
 export type BoundOutcome = {
@@ -22,10 +30,8 @@ const SSE_HEADERS = {
   Connection: 'keep-alive',
 };
 
-function sseWrite(res: http.ServerResponse, event: TaskEvent) {
-  res.write(
-    `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event.data ?? null)}\n\n`
-  );
+function formatEvent(event: TaskEvent): string {
+  return `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event.data ?? null)}\n\n`;
 }
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
@@ -36,11 +42,16 @@ function json(res: http.ServerResponse, status: number, body: unknown) {
 export async function startServer(options: ServerOptions = {}) {
   const stepMs = options.stepMs ?? 400;
   const heartbeatMs = options.heartbeatMs ?? 15_000;
+  const drainTimeoutMs = options.drainTimeoutMs ?? 5_000;
+  const heartbeatPad = '.'.repeat(options.heartbeatPadBytes ?? 0);
 
   const registry = new TaskRegistry({ stepMs });
 
   // What the request-bound endpoint did, for the demo to inspect.
   const bound: { last?: BoundOutcome; ledger: string[] } = { ledger: [] };
+
+  // Subscriptions dropped because the client stopped reading.
+  const stats = { evictedSubscribers: 0 };
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
@@ -64,7 +75,7 @@ export async function startServer(options: ServerOptions = {}) {
       let lastStep: string | undefined;
       const emit: Emit = (type, data) => {
         if (type === 'step.started') lastStep = (data as { step: string }).step;
-        sseWrite(res, { id: ++sequence, type, data });
+        res.write(formatEvent({ id: ++sequence, type, data }));
       };
 
       runAgent(emit, controller.signal, {
@@ -109,7 +120,7 @@ export async function startServer(options: ServerOptions = {}) {
       }
 
       if (req.method === 'POST' && suffix === '/cancel') {
-        return json(res, 200, { cancelled: registry.cancel(task.id) });
+        return json(res, 200, registry.cancel(task.id));
       }
 
       if (req.method === 'GET' && suffix === '/events') {
@@ -118,12 +129,31 @@ export async function startServer(options: ServerOptions = {}) {
         const after = Number(req.headers['last-event-id'] ?? url.searchParams.get('after') ?? 0);
 
         res.writeHead(200, SSE_HEADERS);
-        for (const event of task.events) if (event.id > after) sseWrite(res, event);
+        let drainTimer: NodeJS.Timeout | undefined;
+
+        // A one-way stream cannot tell a quiet client from a dead one by
+        // listening, and heartbeats keep the socket looking active. What gives
+        // a stuck reader away is backpressure: its socket stops draining, so
+        // `write()` returns false and stays that way. Give it a moment, then
+        // drop the subscription. The task is not touched.
+        const send = (chunk: string) => {
+          if (res.write(chunk) || drainTimer) return;
+          drainTimer = setTimeout(() => {
+            stats.evictedSubscribers++;
+            res.destroy();
+          }, drainTimeoutMs);
+          res.once('drain', () => {
+            clearTimeout(drainTimer);
+            drainTimer = undefined;
+          });
+        };
+
+        for (const event of task.events) if (event.id > after) send(formatEvent(event));
         if (task.status !== 'running') return void res.end();
 
-        const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), heartbeatMs);
+        const heartbeat = setInterval(() => send(`: heartbeat${heartbeatPad}\n\n`), heartbeatMs);
         const listener = (event: TaskEvent) => {
-          sseWrite(res, event);
+          send(formatEvent(event));
           if (isTerminalEvent(event)) {
             cleanup();
             res.end();
@@ -131,6 +161,7 @@ export async function startServer(options: ServerOptions = {}) {
         };
         const cleanup = () => {
           clearInterval(heartbeat);
+          clearTimeout(drainTimer);
           task.listeners.delete(listener);
         };
         task.listeners.add(listener);
@@ -151,6 +182,7 @@ export async function startServer(options: ServerOptions = {}) {
     url: `http://127.0.0.1:${port}`,
     registry,
     bound,
+    stats,
     close: async () => {
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));

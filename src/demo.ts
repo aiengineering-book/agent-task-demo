@@ -1,8 +1,18 @@
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { startServer } from './server.js';
 
 const STEP_MS = 300;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitFor(condition: () => boolean, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (condition()) return true;
+    await sleep(25);
+  }
+  return condition();
+}
 
 type SseEvent = { id?: number; type: string; data: any };
 type Subscription = { events: SseEvent[]; heartbeats: number; endedBy: 'server' | 'client' };
@@ -140,10 +150,72 @@ try {
   const cTask = registry.get(c.taskId)!;
   console.log('   cancel response:', cancelled, '| status:', cTask.status);
   assert.equal(cancelled.cancelled, true);
+  assert.equal(cancelled.outcome, 'step_cancelled');
   assert.equal(cTask.status, 'cancelled');
   assert.equal(cTask.events.at(-1)!.type, 'task.cancelled');
   assert.equal(registry.ledger.length, ledgerBefore, 'cancelled before write_file: no side effect');
   rows.push(['C. task, POST /cancel', 'Agent cancelled before write_file, no side effect']);
+
+  // ── D. Cancel arrives after a side effect already happened ────────
+  console.log('\nD. Cancel after the side effect has already happened');
+  const ledgerBeforeD = registry.ledger.length;
+  const d = (await (await fetch(`${url}/api/agents`, { method: 'POST' })).json()) as { taskId: string };
+
+  await readSse(
+    (signal) => fetch(`${url}/api/agents/${d.taskId}/events`, { signal }),
+    (e) => e.type === 'step.completed' && e.data?.step === 'write_file'
+  );
+  const dCancel = (await (await fetch(`${url}/api/agents/${d.taskId}/cancel`, { method: 'POST' })).json()) as any;
+  await registry.get(d.taskId)!.done;
+  const dTask = registry.get(d.taskId)!;
+
+  console.log('   cancel response:', dCancel, '| status:', dTask.status);
+  console.log('   side effects of this task:', dTask.sideEffects);
+  assert.equal(dCancel.cancelled, true);
+  assert.equal(dCancel.outcome, 'side_effect_committed');
+  assert.equal(dTask.status, 'cancelled');
+  assert.equal(registry.ledger.length, ledgerBeforeD + 1, 'the cancel cannot undo the file');
+  rows.push(['D. task, cancel after write_file', 'Cancelled, but report.md was already written']);
+
+  // ── E. A subscriber that stops reading is evicted, the task is not ─
+  console.log('\nE. A subscriber that stops reading');
+  // Padded heartbeats make a non-reading client fill its socket buffer in
+  // under a second. A real client does the same thing, just more slowly.
+  const stuck = await startServer({
+    stepMs: 800,
+    heartbeatMs: 5,
+    heartbeatPadBytes: 65_536,
+    drainTimeoutMs: 300,
+  });
+  try {
+    const created = (await (await fetch(`${stuck.url}/api/agents`, { method: 'POST' })).json()) as { taskId: string };
+
+    // Connect, then never read: the socket buffer fills and stops draining.
+    await new Promise<void>((resolve) => {
+      const request = http.get(`${stuck.url}/api/agents/${created.taskId}/events`, (response) => {
+        response.on('error', () => {});
+        response.pause();
+        resolve();
+      });
+      request.on('error', () => {});
+    });
+
+    const evicted = await waitFor(() => stuck.stats.evictedSubscribers >= 1, 8_000);
+    const stuckTask = stuck.registry.get(created.taskId)!;
+    console.log(`   evicted subscribers: ${stuck.stats.evictedSubscribers}, ` +
+      `task status at that moment: ${stuckTask.status}, subscribers left: ${stuckTask.listeners.size}`);
+    assert.ok(evicted, 'a subscriber that never reads must be evicted');
+    assert.equal(stuck.stats.evictedSubscribers, 1);
+    assert.equal(stuckTask.status, 'running', 'evicting the subscriber must not stop the task');
+    assert.equal(stuckTask.listeners.size, 0);
+
+    await stuckTask.done;
+    assert.equal(stuckTask.status, 'completed');
+    console.log('   task then completed on its own');
+    rows.push(['E. subscriber stops reading', 'Subscription evicted, task still completed']);
+  } finally {
+    await stuck.close();
+  }
 
   console.log('\nSummary');
   for (const [scenario, outcome] of rows) console.log(`  ${scenario.padEnd(36)} ${outcome}`);

@@ -16,6 +16,8 @@ export type Task = {
   events: TaskEvent[];
   result?: string;
   error?: string;
+  /** What this task has already changed in the outside world. */
+  sideEffects: string[];
   controller: AbortController;
   listeners: Set<(event: TaskEvent) => void>;
   done: Promise<void>;
@@ -23,6 +25,14 @@ export type Task = {
 
 const TERMINAL = new Set(['task.completed', 'task.cancelled', 'task.failed']);
 export const isTerminalEvent = (event: TaskEvent) => TERMINAL.has(event.type);
+
+/**
+ * What a cancel actually did. "Cancelled" alone hides the difference between
+ * stopping work that had changed nothing and stopping work that had already
+ * committed a side effect.
+ */
+export type CancelOutcome = 'step_cancelled' | 'side_effect_committed';
+export type CancelResult = { cancelled: boolean; outcome?: CancelOutcome };
 
 /**
  * In-memory task registry. The task, not the HTTP connection, owns the Agent:
@@ -43,6 +53,7 @@ export class TaskRegistry {
       id: `task_${randomUUID().slice(0, 8)}`,
       status: 'running',
       events: [],
+      sideEffects: [],
       controller: new AbortController(),
       listeners: new Set(),
       done: Promise.resolve(),
@@ -60,7 +71,10 @@ export class TaskRegistry {
       try {
         task.result = await runAgent(emit, task.controller.signal, {
           stepMs: this.options.stepMs,
-          onSideEffect: (effect) => this.ledger.push(effect),
+          onSideEffect: (effect) => {
+            task.sideEffects.push(effect);
+            this.ledger.push(effect);
+          },
         });
         task.status = 'completed';
         emit('task.completed', { result: task.result });
@@ -84,10 +98,13 @@ export class TaskRegistry {
   }
 
   /** An explicit user decision, unlike a disconnect. */
-  cancel(id: string): boolean {
+  cancel(id: string): CancelResult {
     const task = this.tasks.get(id);
-    if (!task || task.status !== 'running') return false;
+    if (!task || task.status !== 'running') return { cancelled: false };
+
+    const outcome: CancelOutcome =
+      task.sideEffects.length > 0 ? 'side_effect_committed' : 'step_cancelled';
     task.controller.abort(new Error('cancelled by user'));
-    return true;
+    return { cancelled: true, outcome };
   }
 }
